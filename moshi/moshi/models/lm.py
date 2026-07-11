@@ -665,6 +665,8 @@ class LMGen(StreamingModule[_LMGenState]):
         save_voice_prompt_embeddings: bool = False,
         sample_rate: int = 32000,
         frame_rate: int = FRAME_RATE_HZ,
+        text_rep_penalty: float = 1.0,
+        text_rep_window: int = 750,
     ):
         assert not lm_model.training, "generation shouldn't be used in training mode."
         super().__init__()
@@ -711,6 +713,25 @@ class LMGen(StreamingModule[_LMGenState]):
         self.record_history = False
         self._history: deque = deque(maxlen=1)
 
+        # Text-channel repetition penalty (>1.0 enables). Long live sessions
+        # degenerate into a self-reinforcing template loop ("I can't X. Is
+        # there anything else I can help with?" for every question) whose
+        # terminal state is permanent PAD/silence: repeated phrases dominate
+        # the visible context, sampling (top-k, no repetition control) locks
+        # onto them, and each context refresh distills the loop further. The
+        # penalty divides the pre-sampling logit of every text token the
+        # model itself SAMPLED in the last `text_rep_window` steps (forced
+        # tokens — prompt / replayed history — are exempt, so persona
+        # vocabulary is never suppressed). Sync-free: a token ring plus a
+        # per-vocab count tensor, all on device. Batch size 1 only.
+        self.text_rep_penalty = float(text_rep_penalty)
+        self.text_rep_window = max(1, int(text_rep_window))
+        self._rep_ptr = 0
+        self._rep_buffer = torch.full((self.text_rep_window,), -1,
+                                      device=lm_model.device, dtype=torch.long)
+        self._rep_counts = torch.zeros(lm_model.text_card + 1,
+                                       device=lm_model.device, dtype=torch.long)
+
         # Persistent prompt cache: a deep copy of every streaming-state tensor
         # (backbone KV ring caches, position offsets, LMGen token delay-ring)
         # taken once, right after the system prompts (voice + text) have been
@@ -728,6 +749,13 @@ class LMGen(StreamingModule[_LMGenState]):
 
     def clear_history(self):
         self._history.clear()
+
+    def clear_text_repetition(self):
+        """Forget the repetition-penalty window (e.g. after a prompt-only
+        recovery refresh, when no dialogue remains in the context)."""
+        self._rep_ptr = 0
+        self._rep_buffer.fill_(-1)
+        self._rep_counts.zero_()
 
     @property
     def has_prompt_snapshot(self) -> bool:
@@ -1045,8 +1073,21 @@ class LMGen(StreamingModule[_LMGenState]):
         lm_model = self.lm_model
 
         # Shape of text_logits should be [B, K_text=1, T=1, Card_text]
+        text_logits_f = text_logits.float()
+        rep_active = self.text_rep_penalty > 1.0 and text_logits_f.shape[0] == 1
+        if rep_active:
+            # Penalize every token the model itself sampled within the window
+            # (CTRL-style: positive logits divided, negative multiplied).
+            # Fixed shapes, no host sync — safe in the realtime hot path.
+            card = text_logits_f.shape[-1]
+            recent = self._rep_counts[:card] > 0
+            tl = text_logits_f[0, 0, 0]
+            penalized = torch.where(tl > 0,
+                                    tl / self.text_rep_penalty,
+                                    tl * self.text_rep_penalty)
+            text_logits_f[0, 0, 0] = torch.where(recent, penalized, tl)
         sampled_text_token = sample_token(
-            text_logits.float(),
+            text_logits_f,
             self.use_sampling,
             self.temp_text,
             self.top_k_text,
@@ -1057,6 +1098,25 @@ class LMGen(StreamingModule[_LMGenState]):
         sampled_text_token = sampled_text_token[:, 0, 0]  # shape is [B]
 
         next_text_token = torch.where(provided_[:, 0, 0], target_[:, 0, 0], sampled_text_token)
+
+        if rep_active:
+            # Record the step into the rolling window: the sampled token if it
+            # is a real (non-special, non-forced) word piece, else -1. Forced
+            # steps (prompt / replayed history) are exempt so the persona
+            # vocabulary from the system prompt is never penalized.
+            tok = next_text_token[0]
+            is_word = ((~provided_[0, 0, 0])
+                       & (tok > 3)  # 0..3 = EPAD/BOS/EOS/PAD
+                       & (tok < lm_model.text_card))
+            slot = self._rep_ptr % self._rep_buffer.shape[0]
+            old = self._rep_buffer[slot]
+            self._rep_counts.scatter_add_(
+                0, old.clamp(min=0).view(1), (old >= 0).long().neg().view(1))
+            new_tok = torch.where(is_word, tok, old.new_full((), -1))
+            self._rep_buffer[slot] = new_tok
+            self._rep_counts.scatter_add_(
+                0, new_tok.clamp(min=0).view(1), is_word.long().view(1))
+            self._rep_ptr += 1
 
         if self.return_logits:
             sampled_audio_tokens, audio_logits = state.graphed_depth(next_text_token, transformer_out, target_[:,lm_model.audio_offset:,0], provided_[:,lm_model.audio_offset:,0]) # [B, K_audio, Card_audio]

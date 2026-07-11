@@ -49,7 +49,7 @@ import random
 from .client_utils import make_log, colorize
 from .models import loaders, MimiModel, LMModel, LMGen
 from .utils.connection import create_ssl_context, get_lan_ip
-from .utils.diagnostics import diag, _env_flag, _env_int, _IN_SPEECH_RMS, _OUT_SPEECH_RMS
+from .utils.diagnostics import diag, _env_flag, _env_float, _env_int, _IN_SPEECH_RMS, _OUT_SPEECH_RMS
 from .utils.logging import setup_logger, ColorizedLog
 
 
@@ -105,12 +105,20 @@ class ServerState:
         self.device = device
         self.voice_prompt_dir = voice_prompt_dir
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
+        # Text repetition penalty: long sessions otherwise degenerate into a
+        # self-reinforcing template loop ("I can't X. Is there anything else I
+        # can help with?") that ends in permanent silence (text channel stuck
+        # on PAD). See LMGen for the mechanism. 1.0 disables.
+        self.text_rep_penalty = _env_float("PERSONAPLEX_TEXT_REP_PENALTY", 1.15)
+        self.text_rep_window = _env_int("PERSONAPLEX_TEXT_REP_WINDOW", 750)
         self.lm_gen = LMGen(lm,
                             audio_silence_frame_cnt=int(0.5 * self.mimi.frame_rate),
                             sample_rate=self.mimi.sample_rate,
                             device=device,
                             frame_rate=self.mimi.frame_rate,
                             save_voice_prompt_embeddings=save_voice_prompt_embeddings,
+                            text_rep_penalty=self.text_rep_penalty,
+                            text_rep_window=self.text_rep_window,
         )
         
         # Periodic context refresh: the model's RoPE positions are absolute
@@ -135,6 +143,14 @@ class ServerState:
         # backbone (~batch times faster than per-step: one 7B forward is
         # memory-bandwidth bound regardless of T). <=1 falls back to per-step.
         self.refresh_batch = _env_int("PERSONAPLEX_REFRESH_BATCH", 64)
+        # Silence-recovery watchdog: if the user has spoken since the model's
+        # last word and the model has stayed mute for this many seconds, an
+        # emergency refresh restores the prompt snapshot WITHOUT history
+        # (dropping the degenerate dialogue that caused the mutism). The model
+        # behaves like a fresh conversation start afterwards — a greeting is
+        # possible — but the session comes back to life instead of staying
+        # permanently silent. 0 disables.
+        self.recovery_silence_secs = _env_int("PERSONAPLEX_RECOVERY_SILENCE_SECS", 45)
 
         self.lock = asyncio.Lock()
         self.mimi.streaming_forever(1)
@@ -240,6 +256,13 @@ class ServerState:
             all_pcm_data = None
             frame_idx = 0
             quiet_run = 0  # consecutive frames with neither side speaking
+            # Silence-recovery tracking: when the model's last word predates
+            # user speech by recovery_silence_secs, it is considered muted
+            # (degenerated into the PAD attractor) and gets a prompt-only
+            # emergency refresh. Initialized so a session where nobody has
+            # spoken yet can never trigger.
+            last_word_mono = time.monotonic()
+            last_user_voice_mono = last_word_mono - 1.0
 
             while True:
                 if close:
@@ -303,12 +326,18 @@ class ServerState:
                             text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
                         # ---- Context-refresh trigger ----
                         if refresh["enabled"] and not refresh["in_progress"]:
+                            _now = time.monotonic()
+                            if text_token not in (0, 3):
+                                last_word_mono = _now
+                            if in_rms >= _IN_SPEECH_RMS:
+                                last_user_voice_mono = _now
                             if in_rms < _IN_SPEECH_RMS and out_rms < _OUT_SPEECH_RMS:
                                 quiet_run += 1
                             else:
                                 quiet_run = 0
                             offset_now = self.lm_gen._streaming_state.offset
                             reason = None
+                            history_override = None
                             if offset_now >= refresh["hard_offset"]:
                                 reason = (f"hard deadline: offset {offset_now} at "
                                           f"hard_offset={refresh['hard_offset']} "
@@ -318,9 +347,30 @@ class ServerState:
                                 reason = (f"quiet moment ({quiet_run} silent frames) with "
                                           f"offset {offset_now} past "
                                           f"soft_offset={refresh['soft_offset']}")
+                            elif (self.recovery_silence_secs > 0
+                                  and _now - last_word_mono > self.recovery_silence_secs
+                                  and last_user_voice_mono > last_word_mono
+                                  and _now - last_user_voice_mono > 3.0):
+                                # The user asked something after the model's
+                                # last word, waited, and the model has been
+                                # mute for recovery_silence_secs: the text
+                                # channel has collapsed into the PAD attractor
+                                # (repetition death spiral). Restore the
+                                # prompt snapshot WITHOUT the poisoned
+                                # history so the session comes back to life.
+                                reason = (f"SILENCE RECOVERY: no model word for "
+                                          f"{_now - last_word_mono:.0f}s despite user "
+                                          f"speech; restoring prompt without history")
+                                history_override = 0
                             if reason is not None:
-                                await do_refresh(reason, offset_now)
+                                if history_override == 0:
+                                    # No dialogue survives this refresh; the
+                                    # repetition window must forget it too.
+                                    self.lm_gen.clear_text_repetition()
+                                await do_refresh(reason, offset_now,
+                                                 history_steps=history_override)
                                 quiet_run = 0
+                                last_word_mono = time.monotonic()
                                 # Drop mic audio that arrived while refreshing: it
                                 # is stale by the refresh duration, and stepping
                                 # the model through it would burn context steps
@@ -482,7 +532,12 @@ class ServerState:
                            history_steps=self.refresh_history_steps,
                            batch=self.refresh_batch)
 
-            async def do_refresh(reason: str, offset_at_trigger: int):
+            async def do_refresh(reason: str, offset_at_trigger: int,
+                                 history_steps: int | None = None):
+                # history_steps=0 is the emergency (silence-recovery) variant:
+                # restore the prompt snapshot only, dropping recorded dialogue.
+                _history_steps = (self.refresh_history_steps
+                                  if history_steps is None else history_steps)
                 refresh["in_progress"] = True
                 _t0 = time.monotonic()
                 clog.log("info", f"context refresh #{refresh['count'] + 1} triggered "
@@ -490,7 +545,7 @@ class ServerState:
                 diag.event("REFRESH", f"triggered: {reason}",
                            lm_offset=offset_at_trigger,
                            batch=self.refresh_batch,
-                           history_steps=self.refresh_history_steps)
+                           history_steps=_history_steps)
                 # No output frames are produced while refreshing; silence the
                 # watchdog's stall detector so it doesn't dump false snapshots.
                 diag.suspend_stall_checks(600)
@@ -519,7 +574,7 @@ class ServerState:
                     stats = await self.lm_gen.refresh_context_async(
                         is_alive=refresh_alive,
                         batch_size=self.refresh_batch,
-                        history_steps=self.refresh_history_steps)
+                        history_steps=_history_steps)
                 except Exception:
                     refresh["enabled"] = False
                     clog.log("error", "context refresh FAILED; disabled for this session")
@@ -801,6 +856,17 @@ def main():
             f"history_steps={state.refresh_history_steps}, batch={state.refresh_batch}")
     else:
         logger.info("context refresh disabled (PERSONAPLEX_REFRESH=0)")
+    if state.text_rep_penalty > 1.0:
+        logger.info(f"text repetition penalty enabled: penalty={state.text_rep_penalty}, "
+                    f"window={state.text_rep_window} steps "
+                    f"(~{state.text_rep_window / loaders.FRAME_RATE:.0f}s)")
+    else:
+        logger.info("text repetition penalty disabled (PERSONAPLEX_TEXT_REP_PENALTY<=1)")
+    if state.recovery_silence_secs > 0:
+        logger.info(f"silence recovery enabled: prompt-only refresh after "
+                    f"{state.recovery_silence_secs}s of model mutism despite user speech")
+    else:
+        logger.info("silence recovery disabled (PERSONAPLEX_RECOVERY_SILENCE_SECS=0)")
 
     logger.info("warming up the model")
     _warmup_t0 = time.monotonic()
