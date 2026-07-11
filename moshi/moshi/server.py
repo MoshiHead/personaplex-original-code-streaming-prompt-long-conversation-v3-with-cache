@@ -425,19 +425,37 @@ class ServerState:
             }
             if refresh["enabled"]:
                 # After a refresh the offset restarts at ~prompt_end+history.
-                # Make sure that leaves a sane cycle before the next trigger.
                 _post = _prompt_end + self.refresh_history_steps
-                if refresh["soft_offset"] - _post < 250:
+                # Prompt-anchored soft trigger: the last prompt step falls out
+                # of the attention window at offset prompt_end + context, and
+                # from there the model no longer sees the system prompt at all.
+                # Refreshing at the first quiet moment past that point keeps
+                # the prompt continuously effective (it fades for seconds, not
+                # minutes). The configured soft offset stays an upper bound and
+                # the hard offset still guards the position cliff.
+                _ctx = self.lm_gen.lm_model.context
+                _soft = refresh["soft_offset"]
+                if _ctx is not None:
+                    _soft = min(_soft, _prompt_end + _ctx)
+                # Leave a sane cycle after each refresh before re-triggering.
+                _soft = max(_soft, _post + 250)
+                if _soft > refresh["hard_offset"]:
                     refresh["enabled"] = False
                     clog.log("error",
                              f"context refresh disabled: prompt+history ({_post} steps) "
-                             f"leaves no room below soft_offset={refresh['soft_offset']}; "
+                             f"leaves no refresh cycle below hard_offset={refresh['hard_offset']}; "
                              f"shorten the text prompt or PERSONAPLEX_REFRESH_HISTORY_STEPS")
                     diag.event("REFRESH", "disabled: prompt+history too long for the "
                                "configured trigger offsets", level="error",
                                prompt_end=_prompt_end,
                                history_steps=self.refresh_history_steps,
-                               soft_offset=refresh["soft_offset"])
+                               hard_offset=refresh["hard_offset"])
+                elif _soft != refresh["soft_offset"]:
+                    diag.event("REFRESH", "soft trigger anchored to the prompt window",
+                               configured_soft_offset=refresh["soft_offset"],
+                               effective_soft_offset=_soft,
+                               prompt_end=_prompt_end, context=_ctx)
+                    refresh["soft_offset"] = _soft
             if refresh["enabled"]:
                 # Persistent prompt cache: deep-copy the post-prompt streaming
                 # state (KV caches + offsets) exactly once. Every refresh
@@ -502,33 +520,53 @@ class ServerState:
                         is_alive=refresh_alive,
                         batch_size=self.refresh_batch,
                         history_steps=self.refresh_history_steps)
-                    refresh["count"] += 1
-                    _secs = time.monotonic() - _t0
-                    if stats["completed"]:
-                        clog.log("info", f"context refresh #{refresh['count']} completed: "
-                                         f"offset {offset_at_trigger} -> {stats['offset_after']} "
-                                         f"in {_secs:.1f}s")
-                        diag.event("REFRESH", "completed successfully",
-                                   secs=round(_secs, 2),
-                                   keepalive_frames=keepalive_sent,
-                                   count=refresh["count"], **stats)
-                    else:
-                        clog.log("warning",
-                                 f"context refresh #{refresh['count']} PARTIAL: "
-                                 f"{stats['offset_after']}/{stats['expected_steps']} steps "
-                                 f"in {_secs:.1f}s (connection closing)")
-                        diag.event("REFRESH", "PARTIAL (aborted by disconnect)",
-                                   secs=round(_secs, 2),
-                                   keepalive_frames=keepalive_sent,
-                                   level="warning", **stats)
-                    diag.count("refreshes")
-                    diag.gauge("last_refresh_offset", stats["offset_after"])
                 except Exception:
                     refresh["enabled"] = False
                     clog.log("error", "context refresh FAILED; disabled for this session")
                     diag.event("REFRESH",
                                f"FAILED, disabled for this session:\n{traceback.format_exc()}",
                                level="error")
+                else:
+                    refresh["count"] += 1
+                    # Reporting only from here on. It runs under its own guard:
+                    # a bug in the logging must never disable the refresh
+                    # safety mechanism (a duplicate-'secs' TypeError here once
+                    # masqueraded as a refresh failure, knocked out refreshes
+                    # for the session, and let the offset sail past the
+                    # position cliff into permanent silence).
+                    try:
+                        _secs = time.monotonic() - _t0
+                        # refresh_context_async also reports its own 'secs';
+                        # the wall-clock time measured here (incl. keepalive
+                        # pacing) supersedes it — drop it to avoid a duplicate
+                        # keyword in diag.event.
+                        stats.pop("secs", None)
+                        if stats["completed"]:
+                            clog.log("info", f"context refresh #{refresh['count']} completed: "
+                                             f"offset {offset_at_trigger} -> {stats['offset_after']} "
+                                             f"in {_secs:.1f}s")
+                            diag.event("REFRESH", "completed successfully",
+                                       secs=round(_secs, 2),
+                                       keepalive_frames=keepalive_sent,
+                                       count=refresh["count"], **stats)
+                        else:
+                            clog.log("warning",
+                                     f"context refresh #{refresh['count']} PARTIAL: "
+                                     f"{stats['offset_after']}/{stats['expected_steps']} steps "
+                                     f"in {_secs:.1f}s (connection closing)")
+                            diag.event("REFRESH", "PARTIAL (aborted by disconnect)",
+                                       secs=round(_secs, 2),
+                                       keepalive_frames=keepalive_sent,
+                                       level="warning", **stats)
+                        diag.count("refreshes")
+                        diag.gauge("last_refresh_offset", stats["offset_after"])
+                    except Exception:
+                        clog.log("warning", "post-refresh reporting failed "
+                                            "(the refresh itself succeeded)")
+                        diag.event("REFRESH",
+                                   "post-refresh reporting failed (refresh OK):\n"
+                                   f"{traceback.format_exc()}",
+                                   level="warning")
                 finally:
                     refresh["in_progress"] = False
                     # Give the loops a grace period to refresh their heartbeats
