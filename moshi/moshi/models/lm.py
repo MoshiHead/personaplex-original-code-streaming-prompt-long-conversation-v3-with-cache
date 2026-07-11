@@ -31,7 +31,7 @@
 
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from functools import partial
 from os.path import splitext
 import logging
@@ -48,6 +48,7 @@ from ..utils.compile import CUDAGraphed, no_compile
 from ..utils.diagnostics import diag
 from ..modules.streaming import StreamingStateDict, StreamingContainer, StreamingModule, load_streaming_state
 from ..modules.transformer import (
+    RingKVCache,
     StreamingTransformer,
     create_norm_fn,
 )
@@ -710,6 +711,16 @@ class LMGen(StreamingModule[_LMGenState]):
         self.record_history = False
         self._history: deque = deque(maxlen=1)
 
+        # Persistent prompt cache: a deep copy of every streaming-state tensor
+        # (backbone KV ring caches, position offsets, LMGen token delay-ring)
+        # taken once, right after the system prompts (voice + text) have been
+        # stepped at conversation start. `refresh_context_async` restores this
+        # snapshot in place instead of re-injecting the prompt through the
+        # model, so the prompt stays active for the whole session and the
+        # model never re-experiences a "conversation start" mid-dialogue
+        # (which is what used to produce spurious greetings after a refresh).
+        self._prompt_snapshot: Optional[dict] = None
+
     def start_history_recording(self, capacity: int):
         """Enable per-step token recording with the given rolling capacity."""
         self._history = deque(maxlen=max(1, capacity))
@@ -717,6 +728,98 @@ class LMGen(StreamingModule[_LMGenState]):
 
     def clear_history(self):
         self._history.clear()
+
+    @property
+    def has_prompt_snapshot(self) -> bool:
+        return self._prompt_snapshot is not None
+
+    @property
+    def prompt_snapshot_offset(self) -> Optional[int]:
+        """Absolute LM step the cached prompt state ends at (None if unset)."""
+        if self._prompt_snapshot is None:
+            return None
+        return self._prompt_snapshot.get("", {}).get("offset")
+
+    def clear_prompt_snapshot(self):
+        self._prompt_snapshot = None
+
+    @torch.no_grad()
+    def save_prompt_snapshot(self):
+        """Cache the complete post-prompt streaming state.
+
+        Must be called right after `step_system_prompts*` and before any live
+        conversation step. Walks every streaming submodule (LMGen itself, the
+        backbone `StreamingTransformer`, each layer's attention KV ring; the
+        depformer does not propagate streaming state and is stateless between
+        steps) and deep-copies its state tensors:
+
+          - `RingKVCache`: only the `end_offset` first slots are valid at
+            prompt end, so just that slice is cloned (keeps the snapshot a
+            few hundred MB instead of a full-context copy);
+          - plain tensors (offsets, LMGen cache/provided rings): cloned;
+          - plain Python scalars (cpu offsets): stored as-is;
+          - anything else (e.g. the CUDAGraphed callables inside
+            `_LMGenState`) holds no restorable state and is skipped.
+        """
+        snap: dict[str, dict] = {}
+
+        def _add(name: str, module: StreamingModule):
+            state = module._streaming_state
+            assert state is not None, f"{name or 'LMGen'} is not streaming; cannot snapshot."
+            entry: dict = {}
+            for field in fields(state):
+                value = getattr(state, field.name)
+                if isinstance(value, RingKVCache):
+                    valid = min(int(value.end_offset.item()), value.capacity)
+                    entry[field.name] = {
+                        "end_offset": value.end_offset.detach().clone(),
+                        "cache": value.cache[:, :, :, :valid].detach().clone(),
+                    }
+                elif isinstance(value, torch.Tensor):
+                    entry[field.name] = value.detach().clone()
+                elif isinstance(value, (int, float, bool, str, type(None))):
+                    entry[field.name] = value
+            snap[name] = entry
+
+        self._apply_named_streaming(_add)
+        self._prompt_snapshot = snap
+
+    @torch.no_grad()
+    def restore_prompt_snapshot(self) -> bool:
+        """Restore the state cached by `save_prompt_snapshot`, in place.
+
+        Every tensor is written with `copy_` into the existing storage — the
+        CUDA graphs captured by `CUDAGraphed` hold pointers to the KV caches
+        and offset tensors, so the tensors themselves must never be replaced.
+        After this call the model is bit-identical to the moment right after
+        the system prompts were stepped (offset back at prompt end), without
+        a single prompt token having been re-fed through the model.
+
+        Returns False (and does nothing) when no snapshot is cached.
+        """
+        snap = self._prompt_snapshot
+        if snap is None:
+            return False
+
+        def _restore(name: str, module: StreamingModule):
+            state = module._streaming_state
+            assert state is not None, f"{name or 'LMGen'} is not streaming; cannot restore."
+            if name not in snap:
+                raise RuntimeError(f"No prompt snapshot entry for module {name!r}.")
+            for key, saved in snap[name].items():
+                current = getattr(state, key)
+                if isinstance(current, RingKVCache):
+                    current.end_offset.copy_(saved["end_offset"])
+                    current.cache.zero_()
+                    valid = saved["cache"].shape[3]
+                    current.cache[:, :, :, :valid].copy_(saved["cache"])
+                elif isinstance(current, torch.Tensor):
+                    current.copy_(saved)
+                else:
+                    setattr(state, key, saved)
+
+        self._apply_named_streaming(_restore)
+        return True
 
     def _init_streaming_state(self, batch_size: int) -> _LMGenState:
         lm_model = self.lm_model
@@ -1225,27 +1328,30 @@ class LMGen(StreamingModule[_LMGenState]):
     async def refresh_context_async(self, is_alive: Optional[Callable] = None,
                                     batch_size: int = 64,
                                     history_steps: int = 750) -> dict:
-        """Rebuild the model's streaming context from scratch, in place:
+        """Rebuild the model's streaming context, in place.
 
-          1. reset the streaming state (KV caches, offsets -> 0) — identical
-             to what happens at every conversation start;
-          2. replay the voice prompt embeddings (same conv-start pipeline,
-             including the saved cache restore, valid at offset 0);
-          3. replay silence + text prompt + silence (batched fast path);
-          4. teacher-force the last `history_steps` recorded conversation
+        Primary path — persistent prompt cache (no re-injection):
+          1. restore the post-prompt streaming state cached by
+             `save_prompt_snapshot` at conversation start: a handful of
+             in-place device copies bring back the exact KV caches and
+             offsets the prompts produced. No prompt token is fed through
+             the model, so it never re-lives a "conversation start" (the
+             old replay path made it greet mid-conversation);
+          2. teacher-force the last `history_steps` recorded conversation
              steps (batched), so the model keeps its recent dialogue memory.
+
+        Fallback path (no snapshot cached): reset the streaming state and
+        re-step voice prompt embeddings + silence + text prompt + silence,
+        exactly like a conversation start, then the history replay.
 
         This is the fix for the absolute-position cliff: RoPE positions are
         absolute (`rope.py: ts = offset + arange(T)`) and the model collapses
         into permanent silence once its offset passes the maximum position it
         saw in training (~6100 observed across independent runs). Attention
-        only ever spans `context` steps, so rebasing positions to 0 loses
-        nothing except context older than the replayed window.
-
-        Token content/formatting are identical to conversation start; the
-        history replay is ordinary teacher forcing of the model's own recent
-        dialogue, which training-wise looks like a normal session. Returns a
-        stats dict (steps per phase, expected vs actual, duration).
+        only ever spans `context` steps, so rebasing positions to the cached
+        prompt end loses nothing except context older than the replayed
+        window. Returns a stats dict (steps per phase, expected vs actual,
+        duration, whether the snapshot was used).
         """
         t0 = time.monotonic()
         prev_recording = self.record_history
@@ -1254,44 +1360,57 @@ class LMGen(StreamingModule[_LMGenState]):
         if history_steps > 0 and len(self._history) >= 8:
             take = min(history_steps, len(self._history))
             history = torch.stack(list(self._history)[-take:], dim=1)  # [K, M]
+        use_snapshot = self._prompt_snapshot is not None
         expected = 0
-        if self.voice_prompt_embeddings is not None:
-            expected += len(self.voice_prompt_embeddings)
-        if self.text_prompt_tokens is not None:
-            expected += 2 * self.audio_silence_frame_cnt + len(self.text_prompt_tokens)
+        if use_snapshot:
+            expected += self.prompt_snapshot_offset
+        else:
+            if self.voice_prompt_embeddings is not None:
+                expected += len(self.voice_prompt_embeddings)
+            if self.text_prompt_tokens is not None:
+                expected += 2 * self.audio_silence_frame_cnt + len(self.text_prompt_tokens)
         if history is not None:
             expected += history.shape[1]
         stats = {"offset_before": self._diag_offset(), "expected_steps": expected,
+                 "restored_snapshot": use_snapshot,
                  "voice_steps": 0, "prompt_steps": 0, "history_steps": 0}
         try:
-            self.reset_streaming()
-            if self.voice_prompt_embeddings is not None:
-                await self._step_voice_prompt_async(None, is_alive, restore_cache=True)
-                stats["voice_steps"] = self._diag_offset()
-            elif self.voice_prompt_audio is not None:
+            if use_snapshot:
+                self.restore_prompt_snapshot()
+                stats["prompt_steps"] = self._diag_offset()
                 diag.event("REFRESH",
-                           "voice prompt skipped: audio-file voice prompts cannot be "
-                           "replayed mid-conversation (encoding needs a mimi reset); "
-                           "use a precomputed .pt voice prompt", level="warning")
-            o = self._diag_offset()
-            if self.text_prompt_tokens is not None:
-                use_batch = (
-                    batch_size > 1
-                    and not self.report_loss and not self.return_logits
-                    # Past the initial-token special cases and with enough
-                    # forced silence frames to cover the per-step lead-in.
-                    and self._streaming_state is not None
-                    and self._streaming_state.offset > self.max_delay + 2
-                    and self.audio_silence_frame_cnt > self.max_delay + 1
-                    and self.lm_model.delays[0] == 0
-                )
-                if use_batch:
-                    await self._step_forced_span_batched_async(is_alive, batch_size)
-                else:
-                    await self._step_audio_silence_async(is_alive)
-                    await self._step_text_prompt_async(is_alive)
-                    await self._step_audio_silence_async(is_alive)
-            stats["prompt_steps"] = self._diag_offset() - o
+                           "restored cached post-prompt state (prompt kept via "
+                           "KV snapshot; no token re-injection)",
+                           offset=self._diag_offset())
+            else:
+                self.reset_streaming()
+                if self.voice_prompt_embeddings is not None:
+                    await self._step_voice_prompt_async(None, is_alive, restore_cache=True)
+                    stats["voice_steps"] = self._diag_offset()
+                elif self.voice_prompt_audio is not None:
+                    diag.event("REFRESH",
+                               "voice prompt skipped: audio-file voice prompts cannot be "
+                               "replayed mid-conversation (encoding needs a mimi reset); "
+                               "use a precomputed .pt voice prompt", level="warning")
+                o = self._diag_offset()
+                if self.text_prompt_tokens is not None:
+                    use_batch = (
+                        batch_size > 1
+                        and not self.report_loss and not self.return_logits
+                        # Past the initial-token special cases and with enough
+                        # forced silence frames to cover the per-step lead-in.
+                        and self._streaming_state is not None
+                        and self._streaming_state.offset > self.max_delay + 2
+                        and self.audio_silence_frame_cnt > self.max_delay + 1
+                        and self.lm_model.delays[0] == 0
+                    )
+                    if use_batch:
+                        await self._step_forced_span_batched_async(is_alive, batch_size)
+                    else:
+                        await self._step_audio_silence_async(is_alive)
+                        await self._step_text_prompt_async(is_alive)
+                        await self._step_audio_silence_async(is_alive)
+                stats["prompt_steps"] = self._diag_offset() - o
             if history is not None:
                 o = self._diag_offset()
                 await self._step_forced_history_batched_async(history, is_alive, batch_size)

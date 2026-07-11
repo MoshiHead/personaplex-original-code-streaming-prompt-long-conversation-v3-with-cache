@@ -117,11 +117,14 @@ class ServerState:
         # and it collapses into permanent silence once its streaming offset
         # passes the maximum position seen in training (~6100 observed, i.e.
         # ~8 minutes of LM timeline at 12.5 steps/s). Before reaching that
-        # cliff, the server rebuilds the context in place: reset streaming
-        # state (positions -> 0, like a conversation start), then replay the
-        # voice prompt + text prompt + the last ~REFRESH_HISTORY_STEPS of
-        # recorded dialogue tokens, batched (a few seconds, covered by a
-        # silence keepalive). Offsets below are absolute LM steps.
+        # cliff, the server rebuilds the context in place: restore the
+        # post-prompt KV/streaming state cached once at conversation start
+        # (a persistent prompt cache — the voice/text prompts are NOT
+        # re-injected through the model, which used to make it greet
+        # mid-conversation), then replay only the last
+        # ~REFRESH_HISTORY_STEPS of recorded dialogue tokens, batched
+        # (covered by a silence keepalive). Offsets below are absolute LM
+        # steps.
         self.refresh_enabled = _env_flag("PERSONAPLEX_REFRESH", True)
         self.refresh_soft_offset = _env_int("PERSONAPLEX_REFRESH_SOFT_OFFSET", 5200)
         self.refresh_hard_offset = _env_int("PERSONAPLEX_REFRESH_HARD_OFFSET", 5700)
@@ -381,6 +384,9 @@ class ServerState:
             self.lm_gen.reset_streaming()
             self.lm_gen.record_history = False
             self.lm_gen.clear_history()
+            # Drop the previous session's prompt cache (frees VRAM; this
+            # session snapshots its own state right after its prompts).
+            self.lm_gen.clear_prompt_snapshot()
             diag.event("SESSION", "streaming state reset done")
             async def is_alive():
                 if close or ws.closed:
@@ -403,10 +409,11 @@ class ServerState:
 
             # ---- Context-refresh controller state ----
             # The model collapses into silence once its absolute offset passes
-            # ~6100 (max position seen in training). Refresh rebuilds the
-            # context (positions -> 0) before that: soft trigger waits for a
-            # quiet moment from soft_offset on; hard trigger fires regardless
-            # at hard_offset.
+            # ~6100 (max position seen in training). Refresh rebases positions
+            # before that by restoring the cached post-prompt state (see
+            # save_prompt_snapshot below) and replaying recent history: soft
+            # trigger waits for a quiet moment from soft_offset on; hard
+            # trigger fires regardless at hard_offset.
             _prompt_end = self.lm_gen._streaming_state.offset
             refresh = {
                 "enabled": self.refresh_enabled,
@@ -432,13 +439,25 @@ class ServerState:
                                history_steps=self.refresh_history_steps,
                                soft_offset=refresh["soft_offset"])
             if refresh["enabled"]:
+                # Persistent prompt cache: deep-copy the post-prompt streaming
+                # state (KV caches + offsets) exactly once. Every refresh
+                # restores this snapshot in place instead of re-injecting the
+                # voice/text prompts through the model, so the system prompt
+                # stays active for the whole session and the model never
+                # re-experiences a session start (no more mid-conversation
+                # greetings), and .wav voice prompts survive refreshes too.
+                _t_snap = time.monotonic()
+                self.lm_gen.save_prompt_snapshot()
                 self.lm_gen.start_history_recording(self.refresh_history_steps + 8)
                 clog.log("info",
-                         f"context refresh armed: prompt spans steps 0..{_prompt_end}, "
+                         f"context refresh armed: prompt spans steps 0..{_prompt_end} "
+                         f"(post-prompt state cached in {time.monotonic() - _t_snap:.2f}s; "
+                         f"refreshes restore it instead of re-injecting the prompt), "
                          f"soft trigger at lm_offset>={refresh['soft_offset']}, "
                          f"hard at {refresh['hard_offset']}")
                 diag.event("REFRESH", "armed",
                            prompt_end=_prompt_end,
+                           prompt_snapshot_cached=self.lm_gen.has_prompt_snapshot,
                            soft_offset=refresh["soft_offset"],
                            hard_offset=refresh["hard_offset"],
                            quiet_frames=refresh["quiet_frames"],
